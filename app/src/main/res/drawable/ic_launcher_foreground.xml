@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:pivotX="54"
+        android:pivotY="54">
+        <!-- Outer Glowing Pulse Arc (Left) -->
+        <path
+            android:pathData="M33,40 C30,48 30,60 33,68"
+            android:strokeColor="#00E5FF"
+            android:strokeWidth="2.8"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000" />
+        <!-- Outer Glowing Pulse Arc (Right) -->
+        <path
+            android:pathData="M75,40 C78,48 78,60 75,68"
+            android:strokeColor="#00E5FF"
+            android:strokeWidth="2.8"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000" />
+
+        <!-- Mid Wave Arcs -->
+        <path
+            android:pathData="M39,45 C37,50 37,58 39,63"
+            android:strokeColor="#00B0FF"
+            android:strokeWidth="2.2"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000" />
+        <path
+            android:pathData="M69,45 C71,50 71,58 69,63"
+            android:strokeColor="#00B0FF"
+            android:strokeWidth="2.2"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000" />
+
+        <!-- Futuristic Cyber Shield / Call Core Badge -->
+        <path
+            android:pathData="M54,28 L66,35 L66,54 C66,66 54,76 54,76 C54,76 42,66 42,54 L42,35 Z">
+            <aapt:attr name="android:fillColor">
+                <gradient
+                    android:startX="42"
+                    android:startY="28"
+                    android:endX="66"
+                    android:endY="76"
+                    android:type="linear">
+                    <item android:color="#00E5FF" android:offset="0.0" />
+                    <item android:color="#0052CC" android:offset="1.0" />
+                </gradient>
+            </aapt:attr>
+        </path>
+
+        <!-- Inner Shield Shadow & Contour -->
+        <path
+            android:pathData="M54,32 L63,38 L63,53 C63,63 54,71 54,71 C54,71 45,63 45,53 L45,38 Z"
+            android:fillColor="#06101E" />
+
+        <!-- Equalizer / Pulse Spectrum Wave Inside Shield -->
+        <!-- Center Peak Bar -->
+        <path
+            android:pathData="M54,42 L54,62"
+            android:strokeColor="#00E5FF"
+            android:strokeWidth="2.6"
+            android:strokeLineCap="round" />
+        <!-- Left Bar 1 -->
+        <path
+            android:pathData="M50,46 L50,58"
+            android:strokeColor="#00E676"
+            android:strokeWidth="2.2"
+            android:strokeLineCap="round" />
+        <!-- Left Bar 2 -->
+        <path
+            android:pathData="M46,50 L46,54"
+            android:strokeColor="#00B0FF"
+            android:strokeWidth="2.0"
+            android:strokeLineCap="round" />
+        <!-- Right Bar 1 -->
+        <path
+            android:pathData="M58,45 L58,59"
+            android:strokeColor="#00E676"
+            android:strokeWidth="2.2"
+            android:strokeLineCap="round" />
+        <!-- Right Bar 2 -->
+        <path
+            android:pathData="M62,49 L62,55"
+            android:strokeColor="#00B0FF"
+            android:strokeWidth="2.0"
+            android:strokeLineCap="round" />
+
+        <!-- AI Core Diamond -->
+        <path
+            android:pathData="M54,37 L56,40 L54,43 L52,40 Z"
+            android:fillColor="#FFFFFF" />
+    </group>
+</vector>

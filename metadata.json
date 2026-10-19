@@ -1,0 +1,6 @@
+{
+  "name": "CallPulse AI",
+  "description": "Production-ready call recording and intelligence application with Agnes AI speech analytics, audio forensics, verbal contract guard, and autonomous action executor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
