@@ -157,7 +157,8 @@ class CallRecordingService : Service() {
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
-    private var wakeLock: PowerManager.WakeLock? = null
+    private var captureWakeLock: PowerManager.WakeLock? = null
+    private var sessionSetupJob: Job? = null
     private var audioRecord: AudioRecord? = null
     private var audioCleanupEngine: AudioCleanupEngine? = null
 
@@ -183,7 +184,7 @@ class CallRecordingService : Service() {
     private var savedNumber: String? = null
     private var isIncomingCall = false
 
-    private val sampleRate = 16000
+    private var sampleRate = 16000
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
 
@@ -192,7 +193,6 @@ class CallRecordingService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        acquireWakeLock()
         registerPhoneStateReceiver()
         // Sync the UI observable with the persisted monitoring flag (e.g. after rotation).
         _isMonitoring.value = prefs.getBoolean(PREF_MONITORING_ENABLED, false)
@@ -398,21 +398,6 @@ class CallRecordingService : Service() {
     // Foreground plumbing
     // -------------------------------------------------------------------------
 
-    private fun acquireWakeLock() {
-        try {
-            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "CallPulseAI::RecordingWakeLock"
-            ).apply {
-                acquire(10 * 60 * 1000L /* 10 minutes */)
-            }
-            Log.d(TAG, "Acquired partial WakeLock")
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to acquire WakeLock: ${e.message}")
-        }
-    }
-
     private fun startForegroundWith(notification: Notification) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
@@ -430,94 +415,149 @@ class CallRecordingService : Service() {
     // -------------------------------------------------------------------------
 
     private fun startCaptureSession(phoneNumber: String, contactName: String, callType: String) {
-        activeCallId = "CALL-${System.currentTimeMillis().toString(36).uppercase()}-${UUID.randomUUID().toString().take(4).uppercase()}"
-        activePhoneNumber = phoneNumber
-        activeContactName = contactName
-        activeCallType = callType
-        startTimeMillis = System.currentTimeMillis()
+        // Cancel any half-started session, then set up off the main thread:
+        // source probing blocks ~2.5s and must never ANR the UI/receiver thread.
+        sessionSetupJob?.cancel()
+        if (isCapturing) return
 
-        _isRecording.value = true
-        _recordingDurationSeconds.value = 0
         _currentPhoneNumber.value = phoneNumber
         _currentCallType.value = callType
 
-        val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat).coerceAtLeast(4096)
-
-        // MIC-first audio source selection (VOICE_CALL captures silence for non-system apps)
-        audioRecord = createAudioRecordWithFallback(bufferSize)
-
-        if (audioRecord == null || audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-            Log.e(TAG, "Failed to initialize AudioRecord with either VOICE_CALL or MIC fallback.")
-            stopCaptureSession()
-            return
-        }
-
-        audioCleanupEngine = AudioCleanupEngine(sampleRate)
-        audioRecord?.audioSessionId?.let { sessionId ->
-            audioCleanupEngine?.attachToAudioSession(sessionId)
-        }
-
-        // Prepare raw and cleaned WAV output files
-        val callsDir = File(filesDir, "recordings").apply { mkdirs() }
-        rawOutputFile = File(callsDir, "${activeCallId}_raw.wav")
-        cleanedOutputFile = File(callsDir, "${activeCallId}_cleaned.wav")
-
-        try {
-            rawFileOutputStream = FileOutputStream(rawOutputFile)
-            cleanedFileOutputStream = FileOutputStream(cleanedOutputFile)
-
-            // Write 44-byte empty placeholder header (will patch with exact sizes at finalization)
-            writeWavHeader(rawFileOutputStream!!, 0, sampleRate, 1, 16)
-            writeWavHeader(cleanedFileOutputStream!!, 0, sampleRate, 1, 16)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error opening recording output files: ${e.message}")
-            stopCaptureSession()
-            return
-        }
-
-        isCapturing = true
-        try {
-            audioRecord?.startRecording()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error starting AudioRecord: ${e.message}")
-            stopCaptureSession()
-            return
-        }
-
-        // Launch worker thread for continuous audio buffer read & DSP cleanup
-        captureThread = Thread({
-            val audioBuffer = ByteArray(bufferSize)
-            var totalBytesRead = 0L
-
-            while (isCapturing) {
-                val readBytes = audioRecord?.read(audioBuffer, 0, bufferSize) ?: -1
-                if (readBytes > 0) {
-                    totalBytesRead += readBytes
-
-                    // 1. Write raw unaltered PCM
-                    rawFileOutputStream?.write(audioBuffer, 0, readBytes)
-
-                    // 2. Process through DSP Engine (-16 LUFS voice leveling & 85Hz highpass)
-                    val cleanedBuffer = audioCleanupEngine?.processPcm(audioBuffer, readBytes) ?: audioBuffer
-                    cleanedFileOutputStream?.write(cleanedBuffer, 0, readBytes)
-
-                    // Update live telemetry
-                    val diagnostics = audioCleanupEngine?.getDiagnostics() ?: AudioEngineDiagnostics()
-                    _audioDiagnostics.value = diagnostics
-                    _liveRmsAmplitude.value = diagnostics.currentRms
-                }
+        sessionSetupJob = serviceScope.launch {
+            val probe = selectWorkingAudioSource()
+            if (probe == null || !isActive) {
+                probe?.record?.release()
+                Log.e(TAG, "No working audio source — aborting capture")
+                if (isActive) returnToIdleState()
+                return@launch
             }
-        }, "CallPulse-AudioCapture").apply { start() }
 
-        // Launch duration & notification timer job
-        timerJob = serviceScope.launch {
-            while (isActive && isCapturing) {
-                delay(1000)
-                val elapsed = ((System.currentTimeMillis() - startTimeMillis) / 1000).toInt()
-                _recordingDurationSeconds.value = elapsed
-                val lufs = _audioDiagnostics.value.currentLufs
-                val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                notificationManager.notify(NOTIFICATION_ID, buildRecordingNotification(elapsed, lufs))
+            sampleRate = probe.sampleRate
+            audioRecord = probe.record
+            val bufferSize = probe.bufferSize
+
+            // Capture-scoped wake lock: held for the whole call, however long.
+            // (The old 10-minute onCreate lock could lapse mid-call and cause gaps.)
+            try {
+                captureWakeLock =
+                    (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                        .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CallPulseAI::CaptureWakeLock")
+                        .apply { acquire() }
+            } catch (e: Exception) {
+                Log.w(TAG, "Capture wake lock failed: ${e.message}")
+            }
+
+            activeCallId = "CALL-${System.currentTimeMillis().toString(36).uppercase()}-${UUID.randomUUID().toString().take(4).uppercase()}"
+            activePhoneNumber = phoneNumber
+            activeContactName = contactName
+            activeCallType = callType
+            startTimeMillis = System.currentTimeMillis()
+
+            audioCleanupEngine = AudioCleanupEngine(sampleRate)
+            probe.record.audioSessionId.let { sessionId ->
+                audioCleanupEngine?.attachToAudioSession(sessionId)
+            }
+
+            // Prepare raw and cleaned WAV output files
+            val callsDir = File(filesDir, "recordings").apply { mkdirs() }
+            rawOutputFile = File(callsDir, "${activeCallId}_raw.wav")
+            cleanedOutputFile = File(callsDir, "${activeCallId}_cleaned.wav")
+
+            try {
+                rawFileOutputStream = FileOutputStream(rawOutputFile)
+                cleanedFileOutputStream = FileOutputStream(cleanedOutputFile)
+
+                // Write 44-byte empty placeholder header (patched at finalization,
+                // and every 30s during capture so a killed recording stays playable)
+                writeWavHeader(rawFileOutputStream!!, 0, sampleRate, 1, 16)
+                writeWavHeader(cleanedFileOutputStream!!, 0, sampleRate, 1, 16)
+
+                // Flush the probe's lead bytes: no call audio is lost to validation.
+                rawFileOutputStream?.write(probe.leadBytes)
+                val cleanedLead = audioCleanupEngine?.processPcm(probe.leadBytes, probe.leadBytes.size)
+                    ?: probe.leadBytes
+                cleanedFileOutputStream?.write(cleanedLead, 0, probe.leadBytes.size)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error opening recording output files: ${e.message}")
+                stopCaptureSession()
+                returnToIdleState()
+                return@launch
+            }
+
+            isCapturing = true
+            _isRecording.value = true
+            _recordingDurationSeconds.value = 0
+            // NOTE: probe.record is already started.
+
+            // Launch worker thread for continuous audio buffer read & DSP cleanup
+            captureThread = Thread({
+                val audioBuffer = ByteArray(bufferSize)
+                var consecutiveErrors = 0
+
+                while (isCapturing) {
+                    val readBytes = try {
+                        audioRecord?.read(audioBuffer, 0, bufferSize) ?: -1
+                    } catch (e: Exception) {
+                        -1
+                    }
+                    if (readBytes > 0) {
+                        consecutiveErrors = 0
+
+                        // 1. Write raw unaltered PCM
+                        try {
+                            rawFileOutputStream?.write(audioBuffer, 0, readBytes)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Raw write failed (storage full?): ${e.message}")
+                            break
+                        }
+
+                        // 2. Process through DSP Engine (-16 LUFS voice leveling & 85Hz highpass)
+                        val cleanedBuffer = audioCleanupEngine?.processPcm(audioBuffer, readBytes) ?: audioBuffer
+                        try {
+                            cleanedFileOutputStream?.write(cleanedBuffer, 0, readBytes)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Cleaned write failed (storage full?): ${e.message}")
+                            break
+                        }
+
+                        // Update live telemetry
+                        val diagnostics = audioCleanupEngine?.getDiagnostics() ?: AudioEngineDiagnostics()
+                        _audioDiagnostics.value = diagnostics
+                        _liveRmsAmplitude.value = diagnostics.currentRms
+                    } else {
+                        // Persistent read errors (dead audio HAL, revoked capture):
+                        // stop cleanly instead of writing an endless silent file.
+                        consecutiveErrors++
+                        if (consecutiveErrors > 60) {
+                            Log.e(TAG, "AudioRecord.read failing persistently — aborting capture")
+                            break
+                        }
+                        try { Thread.sleep(50) } catch (_: InterruptedException) { break }
+                    }
+                }
+                if (isCapturing) {
+                    serviceScope.launch {
+                        stopCaptureSession()
+                        returnToIdleState()
+                    }
+                }
+            }, "CallPulse-AudioCapture").apply { start() }
+
+            // Launch duration & notification timer job
+            timerJob = serviceScope.launch {
+                while (isActive && isCapturing) {
+                    delay(1000)
+                    val elapsed = ((System.currentTimeMillis() - startTimeMillis) / 1000).toInt()
+                    _recordingDurationSeconds.value = elapsed
+                    val lufs = _audioDiagnostics.value.currentLufs
+                    val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    notificationManager.notify(NOTIFICATION_ID, buildRecordingNotification(elapsed, lufs))
+                    // Keep the WAV headers honest so a process kill mid-call
+                    // still leaves playable files.
+                    if (elapsed > 0 && elapsed % 30 == 0) {
+                        patchWavHeaders()
+                    }
+                }
             }
         }
     }
@@ -535,32 +575,133 @@ class CallRecordingService : Service() {
      * (or a Bluetooth speaker) — that is a hardware limit for non-system apps,
      * not something software can bypass.
      */
-    private fun createAudioRecordWithFallback(bufferSize: Int): AudioRecord? {
+    /**
+     * Audio source selection with live validation, best-first.
+     *
+     * VOICE_CALL would be ideal (uplink + downlink mix) but it requires the
+     * system-only CAPTURE_AUDIO_OUTPUT permission: on most phones a third-party
+     * app's VOICE_CALL recorder *initializes* yet captures digital silence.
+     * Order: MIC -> VOICE_COMMUNICATION -> VOICE_CALL (last resort).
+     *
+     * Each candidate is started and probed for ~2.5s: a source that delivers
+     * bit-for-bit zero the whole time is a blocked source (even a quiet room
+     * flips LSBs), so it is released and the next candidate is tried. Probe
+     * bytes are kept and written to the output files, so no call audio is lost.
+     * Sample rates fall back 16kHz -> 44.1kHz -> 8kHz when unsupported.
+     */
+    private data class SourceProbe(
+        val record: AudioRecord,
+        val name: String,
+        val sampleRate: Int,
+        val bufferSize: Int,
+        val leadBytes: ByteArray
+    )
+
+    private fun selectWorkingAudioSource(): SourceProbe? {
+        val rates = listOf(16000, 44100, 8000)
         val sources = listOf(
             MediaRecorder.AudioSource.MIC to "MIC",
             MediaRecorder.AudioSource.VOICE_COMMUNICATION to "VOICE_COMMUNICATION",
             MediaRecorder.AudioSource.VOICE_CALL to "VOICE_CALL"
         )
-        for ((source, name) in sources) {
-            try {
-                val record = AudioRecord(source, sampleRate, channelConfig, audioFormat, bufferSize)
-                if (record.state == AudioRecord.STATE_INITIALIZED) {
-                    Log.i(TAG, "AudioRecord initialized with AudioSource.$name")
-                    return record
+        for (rate in rates) {
+            val minBuf = AudioRecord.getMinBufferSize(rate, channelConfig, audioFormat)
+            if (minBuf <= 0) {
+                Log.w(TAG, "Sample rate ${rate}Hz not supported, trying next")
+                continue
+            }
+            val bufferSize = minBuf.coerceAtLeast(4096)
+            for ((source, name) in sources) {
+                val record = try {
+                    AudioRecord(source, rate, channelConfig, audioFormat, bufferSize)
+                } catch (e: Exception) {
+                    Log.w(TAG, "AudioSource.$name@${rate}Hz failed (${e.message})")
+                    null
+                } ?: continue
+                if (record.state != AudioRecord.STATE_INITIALIZED) {
+                    Log.w(TAG, "AudioSource.$name@${rate}Hz did not initialize")
+                    record.release()
+                    continue
                 }
-                record.release()
-                Log.w(TAG, "AudioSource.$name did not initialize, trying next")
-            } catch (e: Exception) {
-                Log.w(TAG, "AudioSource.$name failed (${e.message}), trying next")
+                try {
+                    record.startRecording()
+                } catch (e: Exception) {
+                    Log.w(TAG, "AudioSource.$name@${rate}Hz startRecording threw (${e.message})")
+                    record.release()
+                    continue
+                }
+                val leadBytes = probeSource(record, bufferSize)
+                if (leadBytes == null) {
+                    Log.w(TAG, "AudioSource.$name@${rate}Hz captured digital silence — trying next")
+                    try { record.stop() } catch (_: Exception) { }
+                    record.release()
+                    continue
+                }
+                Log.i(TAG, "Selected audio source: $name @ ${rate}Hz (${leadBytes.size} lead bytes kept)")
+                return SourceProbe(record, name, rate, bufferSize, leadBytes)
             }
         }
-        Log.e(TAG, "All audio sources failed to initialize")
+        Log.e(TAG, "No working audio source found")
         return null
+    }
+
+    /**
+     * Reads up to ~2.5s from a started recorder. Returns the bytes captured,
+     * or null when every sample was bit-for-bit zero (the signature of a
+     * blocked source — real silence still has LSB noise) or reads kept failing.
+     */
+    private fun probeSource(record: AudioRecord, bufferSize: Int): ByteArray? {
+        val out = java.io.ByteArrayOutputStream()
+        val probe = ByteArray(bufferSize)
+        val deadline = System.currentTimeMillis() + 2500
+        var maxAbs = 0
+        var errorStreak = 0
+        while (System.currentTimeMillis() < deadline && out.size() < 16000 * 2 * 3) {
+            val n = try {
+                record.read(probe, 0, bufferSize)
+            } catch (e: Exception) {
+                -1
+            }
+            if (n > 0) {
+                errorStreak = 0
+                out.write(probe, 0, n)
+                var i = 0
+                while (i < n && maxAbs == 0) {
+                    val low = probe[i].toInt() and 0xFF
+                    val high = probe[i + 1].toInt()
+                    val s = (high shl 8) or low
+                    val abs = if (s == Short.MIN_VALUE.toInt()) 32767 else kotlin.math.abs(s)
+                    if (abs > maxAbs) maxAbs = abs
+                    i += 2
+                }
+            } else {
+                errorStreak++
+                if (errorStreak > 20) return null
+                try { Thread.sleep(25) } catch (_: InterruptedException) { return null }
+            }
+        }
+        return if (maxAbs > 0) out.toByteArray() else null
     }
 
     private fun stopCaptureSession() {
         isCapturing = false
         timerJob?.cancel()
+        sessionSetupJob?.cancel()
+        sessionSetupJob = null
+
+        try {
+            if (captureWakeLock?.isHeld == true) {
+                captureWakeLock?.release()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error releasing capture wakeLock: ${e.message}")
+        }
+        captureWakeLock = null
+
+        // No session ever started (e.g. monitor stopped while idle) — nothing to finalize.
+        if (activeCallId.isEmpty()) {
+            return
+        }
 
         try {
             audioRecord?.stop()
@@ -716,6 +857,22 @@ class CallRecordingService : Service() {
         }
     }
 
+    /**
+     * Re-patches the WAV headers with current file lengths. Called every 30s
+     * during capture so a process kill mid-call still leaves playable files,
+     * and once more at finalization.
+     */
+    private fun patchWavHeaders() {
+        try {
+            rawFileOutputStream?.flush()
+            cleanedFileOutputStream?.flush()
+            rawOutputFile?.let { finalizeWavFile(it) }
+            cleanedOutputFile?.let { finalizeWavFile(it) }
+        } catch (e: Exception) {
+            Log.w(TAG, "WAV header patch failed: ${e.message}")
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Notifications
     // -------------------------------------------------------------------------
@@ -822,13 +979,6 @@ class CallRecordingService : Service() {
             Log.w(TAG, "Error unregistering phone-state receiver: ${e.message}")
         }
         stopCaptureSession()
-        try {
-            if (wakeLock?.isHeld == true) {
-                wakeLock?.release()
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Error releasing wakeLock: ${e.message}")
-        }
         super.onDestroy()
     }
 }

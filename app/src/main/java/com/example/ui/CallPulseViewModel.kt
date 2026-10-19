@@ -705,6 +705,24 @@ class CallPulseViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    // Samsung (and other OEMs) keep a separate "sleeping apps" list that kills
+    // even battery-exempted foreground services. There is no API for it — the
+    // user must whitelist the app manually under Battery settings.
+    val isSamsungDevice: Boolean =
+        Build.MANUFACTURER.equals("samsung", ignoreCase = true)
+
+    fun openBatteryOptimizationSettings() {
+        val app = getApplication<Application>()
+        try {
+            val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                .apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK }
+            app.startActivity(intent)
+        } catch (e: Exception) {
+            Log.w("CallPulseViewModel", "Battery settings unavailable, falling back to app settings")
+            openAppSystemSettings()
+        }
+    }
+
     fun parseActions(json: String): List<ActionItemModel> = repository.parseActions(json)
     fun parseContracts(json: String): List<VerbalContractModel> = repository.parseContracts(json)
     fun parseTranscript(json: String): List<DiarizedTurnModel> = repository.parseTranscript(json)

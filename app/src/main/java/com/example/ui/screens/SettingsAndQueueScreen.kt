@@ -77,6 +77,7 @@ fun SettingsAndQueueScreen(
     val autoRecordNumbers by viewModel.autoRecordNumbers.collectAsState()
     val isMonitoring by viewModel.isMonitoring.collectAsState()
     val batteryExempt by viewModel.isBatteryExemptionGranted.collectAsState()
+    val isSamsungDevice = viewModel.isSamsungDevice
     val permissionStates by viewModel.essentialPermissionsGranted.collectAsState()
 
     var numberInput by remember { mutableStateOf("") }
@@ -207,6 +208,45 @@ fun SettingsAndQueueScreen(
                             fontSize = 11.sp,
                             fontFamily = FontFamily.Monospace
                         )
+                    }
+                }
+
+                // Samsung keeps a SEPARATE "sleeping apps" list that kills even
+                // battery-exempted services. No API can fix it — the user must
+                // whitelist the app manually.
+                if (isSamsungDevice) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(
+                                WarningAmber.copy(alpha = 0.08f),
+                                RoundedCornerShape(10.dp)
+                            )
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "Samsung phones can still put CallPulse to sleep and kill monitoring, even when unrestricted above. Add it to \"Never sleeping apps\": Settings → Battery → Background usage limits.",
+                            color = WarningAmber,
+                            fontSize = 11.sp
+                        )
+                        Button(
+                            onClick = { viewModel.openBatteryOptimizationSettings() },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF182A45)),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(40.dp)
+                                .testTag("open_battery_settings_button")
+                        ) {
+                            Text(
+                                text = "OPEN BATTERY SETTINGS",
+                                color = RadarCyan,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
                     }
                 }
 
