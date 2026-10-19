@@ -130,14 +130,14 @@ class CallPulseViewModel(application: Application) : AndroidViewModel(applicatio
         android.Manifest.permission.READ_CALL_LOG to "Call log (caller ID)"
     )
 
-    // Auto-record rules: master toggle for all incoming calls + per-number allowlist
-    val recordAllIncoming = MutableStateFlow(prefs.getBoolean("record_all_incoming", false))
+    // Auto-record allowlist: only numbers on this list are ever recorded, incoming or outgoing.
     val autoRecordNumbers = MutableStateFlow(
         (prefs.getStringSet("auto_record_numbers", emptySet()) ?: emptySet()).sorted()
     )
 
     // Live Service State
     val isRecording: StateFlow<Boolean> = CallRecordingService.isRecording
+    val isMonitoring: StateFlow<Boolean> = CallRecordingService.isMonitoring
     val recordingDuration: StateFlow<Int> = CallRecordingService.recordingDurationSeconds
     val audioDiagnostics: StateFlow<AudioEngineDiagnostics> = CallRecordingService.audioDiagnostics
     val liveRms: StateFlow<Float> = CallRecordingService.liveRmsAmplitude
@@ -267,8 +267,8 @@ class CallPulseViewModel(application: Application) : AndroidViewModel(applicatio
 
     /**
      * Initiates a real Android cellular phone call via ACTION_CALL (or ACTION_DIAL fallback).
-     * Android's TelephonyManager fires broadcast intents (OFFHOOK) which CallStateReceiver
-     * catches to automatically initiate background audio capture and DSP leveling.
+     * When call monitoring is on, the monitor service sees the OFFHOOK itself and
+     * starts capture automatically for allowlist numbers.
      */
     fun placeActualPhoneCall(phoneNumber: String) {
         val cleanNumber = phoneNumber.trim()
@@ -604,10 +604,17 @@ class CallPulseViewModel(application: Application) : AndroidViewModel(applicatio
         prefs.edit().putBoolean("wifi_only", next).apply()
     }
 
-    fun toggleRecordAllIncoming() {
-        val next = !recordAllIncoming.value
-        recordAllIncoming.value = next
-        prefs.edit().putBoolean("record_all_incoming", next).apply()
+    /**
+     * Starts persistent call monitoring. Call this from the UI (foreground context):
+     * the monitor service then watches phone state from inside itself and starts
+     * capture directly for allowlist numbers — no background service start.
+     */
+    fun startCallMonitoring() {
+        CallRecordingService.startMonitoring(getApplication())
+    }
+
+    fun stopCallMonitoring() {
+        CallRecordingService.stopMonitoring(getApplication())
     }
 
     /**

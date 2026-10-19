@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -14,6 +16,7 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
@@ -37,9 +40,21 @@ import java.io.RandomAccessFile
 import java.util.UUID
 
 /**
- * Foreground Call Recording Service
- * Captures 16kHz mono audio with dual audio fallback (VOICE_CALL fallback to MIC).
- * Employs AudioCleanupEngine for -16 LUFS voice normalization and 85Hz rumble filtering.
+ * Foreground Call Recording Service.
+ *
+ * Two modes:
+ * 1. MONITOR mode (persistent): started ONCE from the app UI. Shows an ongoing
+ *    "Call monitoring active" notification and watches phone state from inside
+ *    the already-foreground service. When a call goes off-hook, the allowlist is
+ *    checked and capture starts directly — no background foreground-service
+ *    start, which Android 14+ forbids for the microphone type (while-in-use
+ *    permission restriction; the battery exemption does not bypass it).
+ * 2. MANUAL recording: started from the UI while the app is in the foreground
+ *    (test captures, dialer recordings).
+ *
+ * Auto-record rule: a call is recorded ONLY when its number is on the user's
+ * auto-record allowlist (digit-normalized, last-10 suffix match). Applies to
+ * both incoming and outgoing calls.
  */
 class CallRecordingService : Service() {
 
@@ -50,13 +65,22 @@ class CallRecordingService : Service() {
 
         const val ACTION_START_RECORDING = "com.example.callpulse.START_RECORDING"
         const val ACTION_STOP_RECORDING = "com.example.callpulse.STOP_RECORDING"
+        const val ACTION_START_MONITORING = "com.example.callpulse.START_MONITORING"
+        const val ACTION_STOP_MONITORING = "com.example.callpulse.STOP_MONITORING"
         const val EXTRA_PHONE_NUMBER = "extra_phone_number"
         const val EXTRA_CALL_TYPE = "extra_call_type"
         const val EXTRA_CONTACT_NAME = "extra_contact_name"
 
+        private const val PREFS = "callpulse_prefs"
+        private const val PREF_MONITORING_ENABLED = "monitoring_enabled"
+        private const val PREF_ALLOWLIST = "auto_record_numbers"
+
         // Live Telemetry Observables for UI
         private val _isRecording = MutableStateFlow(false)
         val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
+
+        private val _isMonitoring = MutableStateFlow(false)
+        val isMonitoring: StateFlow<Boolean> = _isMonitoring.asStateFlow()
 
         private val _recordingDurationSeconds = MutableStateFlow(0)
         val recordingDurationSeconds: StateFlow<Int> = _recordingDurationSeconds.asStateFlow()
@@ -73,6 +97,10 @@ class CallRecordingService : Service() {
         private val _liveRmsAmplitude = MutableStateFlow(0.0f)
         val liveRmsAmplitude: StateFlow<Float> = _liveRmsAmplitude.asStateFlow()
 
+        /**
+         * Manual recording start from the UI (app in foreground). Safe: the
+         * foreground-service start happens while the app is in use.
+         */
         fun startRecording(
             context: Context,
             phoneNumber: String = "Unknown Caller",
@@ -92,15 +120,36 @@ class CallRecordingService : Service() {
                     context.startService(intent)
                 }
             } catch (e: Exception) {
-                // Android 12+ throws ForegroundServiceStartNotAllowedException when the app
-                // is in the background without the battery-optimization exemption.
-                Log.e(TAG, "Failed to start recording service from background: ${e.message}")
+                Log.e(TAG, "Failed to start recording service: ${e.message}")
             }
         }
 
         fun stopRecording(context: Context) {
             val intent = Intent(context, CallRecordingService::class.java).apply {
                 action = ACTION_STOP_RECORDING
+            }
+            context.startService(intent)
+        }
+
+        /**
+         * Starts persistent call monitoring. MUST be called from a foreground
+         * (user-visible) context — the Settings UI. That is the only moment
+         * Android allows a microphone-type foreground service to start.
+         */
+        fun startMonitoring(context: Context) {
+            val intent = Intent(context, CallRecordingService::class.java).apply {
+                action = ACTION_START_MONITORING
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        fun stopMonitoring(context: Context) {
+            val intent = Intent(context, CallRecordingService::class.java).apply {
+                action = ACTION_STOP_MONITORING
             }
             context.startService(intent)
         }
@@ -117,6 +166,7 @@ class CallRecordingService : Service() {
     private var cleanedFileOutputStream: FileOutputStream? = null
 
     private var isCapturing = false
+    private var isMonitoring = false
     private var captureThread: Thread? = null
     private var startTimeMillis: Long = 0
     private var timerJob: Job? = null
@@ -126,29 +176,55 @@ class CallRecordingService : Service() {
     private var activeContactName: String = ""
     private var activeCallType: String = "TEST_CAPTURE"
 
+    // Phone-state tracking for the in-service monitor (replaces the old manifest receiver)
+    private var phoneStateReceiver: BroadcastReceiver? = null
+    private var lastTelState = TelephonyManager.EXTRA_STATE_IDLE
+    private var savedNumber: String? = null
+    private var isIncomingCall = false
+
     private val sampleRate = 16000
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+
+    private val prefs by lazy { getSharedPreferences(PREFS, Context.MODE_PRIVATE) }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         acquireWakeLock()
+        registerPhoneStateReceiver()
+        // Sync the UI observable with the persisted monitoring flag (e.g. after rotation).
+        _isMonitoring.value = prefs.getBoolean(PREF_MONITORING_ENABLED, false)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action ?: return START_NOT_STICKY
+        val action = intent?.action
+
+        // Sticky restart (system killed us): resume monitoring only if the user left it on.
+        if (action == null) {
+            if (prefs.getBoolean(PREF_MONITORING_ENABLED, false)) {
+                Log.i(TAG, "Sticky restart — resuming call monitoring.")
+                enterMonitoringMode()
+                return START_STICKY
+            }
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         when (action) {
+            ACTION_START_MONITORING -> enterMonitoringMode()
+
+            ACTION_STOP_MONITORING -> exitMonitoringMode()
+
             ACTION_START_RECORDING -> {
                 val phone = intent.getStringExtra(EXTRA_PHONE_NUMBER) ?: "Unknown Caller"
                 val contact = intent.getStringExtra(EXTRA_CONTACT_NAME) ?: "Unknown Contact"
                 val type = intent.getStringExtra(EXTRA_CALL_TYPE) ?: "INCOMING"
 
                 if (!isCapturing) {
-                    startForegroundWithMicrophone()
+                    startForegroundWith(buildRecordingNotification(0, -16.0))
                     startCaptureSession(phone, contact, type)
                 }
             }
@@ -157,13 +233,169 @@ class CallRecordingService : Service() {
                 if (isCapturing) {
                     stopCaptureSession()
                 }
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                returnToIdleState()
             }
         }
 
-        return START_NOT_STICKY
+        return if (isMonitoring || prefs.getBoolean(PREF_MONITORING_ENABLED, false)) {
+            START_STICKY
+        } else {
+            START_NOT_STICKY
+        }
     }
+
+    // -------------------------------------------------------------------------
+    // Monitor mode
+    // -------------------------------------------------------------------------
+
+    private fun enterMonitoringMode() {
+        isMonitoring = true
+        _isMonitoring.value = true
+        prefs.edit().putBoolean(PREF_MONITORING_ENABLED, true).apply()
+        startForegroundWith(buildMonitorNotification())
+        Log.i(TAG, "Call monitoring ACTIVE — auto-record armed for allowlist numbers.")
+    }
+
+    private fun exitMonitoringMode() {
+        if (isCapturing) {
+            stopCaptureSession()
+        }
+        isMonitoring = false
+        _isMonitoring.value = false
+        prefs.edit().putBoolean(PREF_MONITORING_ENABLED, false).apply()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+        Log.i(TAG, "Call monitoring stopped by user.")
+    }
+
+    /** After a capture ends: back to the monitor notification, or shut down when not monitoring. */
+    private fun returnToIdleState() {
+        if (isMonitoring) {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.notify(NOTIFICATION_ID, buildMonitorNotification())
+        } else {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // In-service phone-state machine (dynamic receiver — lives as long as the service)
+    // -------------------------------------------------------------------------
+
+    private fun registerPhoneStateReceiver() {
+        val filter = IntentFilter().apply {
+            addAction(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
+            addAction(Intent.ACTION_NEW_OUTGOING_CALL)
+        }
+        phoneStateReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                handlePhoneState(intent)
+            }
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(phoneStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(phoneStateReceiver, filter)
+            }
+            Log.d(TAG, "Phone-state monitor receiver registered.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register phone-state receiver: ${e.message}")
+        }
+    }
+
+    private fun handlePhoneState(intent: Intent) {
+        when (intent.action) {
+            Intent.ACTION_NEW_OUTGOING_CALL -> {
+                savedNumber = intent.getStringExtra(Intent.EXTRA_PHONE_NUMBER)
+                isIncomingCall = false
+                Log.d(TAG, "Outgoing call initiated to: $savedNumber")
+            }
+
+            TelephonyManager.ACTION_PHONE_STATE_CHANGED -> {
+                val state = intent.getStringExtra(TelephonyManager.EXTRA_STATE) ?: return
+                val number = intent.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER) ?: savedNumber
+                if (!number.isNullOrBlank()) {
+                    savedNumber = number
+                }
+
+                when (state) {
+                    TelephonyManager.EXTRA_STATE_RINGING -> {
+                        isIncomingCall = true
+                        Log.i(TAG, "Incoming call ringing from $savedNumber")
+                    }
+
+                    TelephonyManager.EXTRA_STATE_OFFHOOK -> {
+                        if (lastTelState != TelephonyManager.EXTRA_STATE_OFFHOOK && !isCapturing) {
+                            val num = savedNumber ?: "Unknown Caller"
+                            val callType = if (isIncomingCall) "INCOMING" else "OUTGOING"
+                            if (shouldAutoRecord(num)) {
+                                Log.i(TAG, "Allowlist match ($num) — starting capture.")
+                                val contact = resolveContactName(num)
+                                // Already foregrounded as the monitor: just swap the
+                                // notification and start capturing. No background start.
+                                startForegroundWith(buildRecordingNotification(0, -16.0))
+                                startCaptureSession(num, contact, callType)
+                            } else {
+                                Log.i(TAG, "Skipping auto-record: $num is not on the allowlist.")
+                            }
+                        }
+                    }
+
+                    TelephonyManager.EXTRA_STATE_IDLE -> {
+                        if (lastTelState == TelephonyManager.EXTRA_STATE_OFFHOOK) {
+                            if (isCapturing) {
+                                Log.i(TAG, "Call ended — finalizing capture.")
+                                stopCaptureSession()
+                                returnToIdleState()
+                            }
+                        }
+                        isIncomingCall = false
+                        savedNumber = null
+                    }
+                }
+                lastTelState = state
+            }
+        }
+    }
+
+    /**
+     * Allowlist-only rule for BOTH directions: record iff the number matches an
+     * entry in the user's auto-record list. Digit-normalized with last-10
+     * suffix fallback so "+1 (555) 123-4567" matches "5551234567".
+     */
+    private fun shouldAutoRecord(number: String?): Boolean {
+        val allowed = prefs.getStringSet(PREF_ALLOWLIST, emptySet()) ?: emptySet()
+        if (allowed.isEmpty()) return false
+        val incoming = number?.filter { it.isDigit() } ?: ""
+        if (incoming.isEmpty()) return false
+        return allowed.any { candidate ->
+            val norm = candidate.filter { it.isDigit() }
+            norm.isNotEmpty() && (norm == incoming || norm.takeLast(10) == incoming.takeLast(10))
+        }
+    }
+
+    private fun resolveContactName(phoneNumber: String?): String {
+        if (phoneNumber.isNullOrBlank() || phoneNumber == "Unknown Caller") return "Unknown Contact"
+        return try {
+            val uri = android.net.Uri.withAppendedPath(
+                android.provider.ContactsContract.PhoneLookup.CONTENT_FILTER_URI,
+                android.net.Uri.encode(phoneNumber)
+            )
+            val projection = arrayOf(android.provider.ContactsContract.PhoneLookup.DISPLAY_NAME)
+            contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) ?: phoneNumber else phoneNumber
+            } ?: phoneNumber
+        } catch (e: Exception) {
+            phoneNumber
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Foreground plumbing
+    // -------------------------------------------------------------------------
 
     private fun acquireWakeLock() {
         try {
@@ -180,8 +412,7 @@ class CallRecordingService : Service() {
         }
     }
 
-    private fun startForegroundWithMicrophone() {
-        val notification = buildRecordingNotification(0, -16.0)
+    private fun startForegroundWith(notification: Notification) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
@@ -192,6 +423,10 @@ class CallRecordingService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Audio capture (unchanged)
+    // -------------------------------------------------------------------------
 
     private fun startCaptureSession(phoneNumber: String, contactName: String, callType: String) {
         activeCallId = "CALL-${System.currentTimeMillis().toString(36).uppercase()}-${UUID.randomUUID().toString().take(4).uppercase()}"
@@ -486,20 +721,62 @@ class CallRecordingService : Service() {
         }
     }
 
-    private fun buildRecordingNotification(durationSeconds: Int, lufs: Double): Notification {
-        val minutes = durationSeconds / 60
-        val seconds = durationSeconds % 60
-        val timerFormatted = String.format("%02d:%02d", minutes, seconds)
+    // -------------------------------------------------------------------------
+    // Notifications
+    // -------------------------------------------------------------------------
 
+    private fun openAppPendingIntent(): PendingIntent {
         val openAppIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
-        val contentPendingIntent = PendingIntent.getActivity(
+        return PendingIntent.getActivity(
             this,
             0,
             openAppIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+    }
+
+    private fun buildMonitorNotification(): Notification {
+        val stopIntent = Intent(this, CallRecordingService::class.java).apply {
+            action = ACTION_STOP_MONITORING
+        }
+        val stopPendingIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            PendingIntent.getForegroundService(
+                this,
+                2,
+                stopIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        } else {
+            PendingIntent.getService(
+                this,
+                2,
+                stopIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        }
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("CallPulse AI: Call monitoring active")
+            .setContentText("Auto-recording calls from your allowlist — even with the app closed.")
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setOngoing(true)
+            .setContentIntent(openAppPendingIntent())
+            .addAction(
+                android.R.drawable.ic_media_pause,
+                "Stop monitoring",
+                stopPendingIntent
+            )
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .build()
+    }
+
+    private fun buildRecordingNotification(durationSeconds: Int, lufs: Double): Notification {
+        val minutes = durationSeconds / 60
+        val seconds = durationSeconds % 60
+        val timerFormatted = String.format("%02d:%02d", minutes, seconds)
 
         val stopIntent = Intent(this, CallRecordingService::class.java).apply {
             action = ACTION_STOP_RECORDING
@@ -516,7 +793,7 @@ class CallRecordingService : Service() {
             .setContentText("Recording $timerFormatted • DSP Normalized: ${String.format("%.1f", lufs)} LUFS")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
-            .setContentIntent(contentPendingIntent)
+            .setContentIntent(openAppPendingIntent())
             .addAction(
                 android.R.drawable.ic_media_pause,
                 "Stop & Analyze",
@@ -534,7 +811,7 @@ class CallRecordingService : Service() {
                 "CallPulse AI Audio Recording",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Shows live call recording telemetry, LUFS leveling, and stop action."
+                description = "Shows call monitoring status and live recording telemetry."
                 setShowBadge(false)
             }
             val manager = getSystemService(NotificationManager::class.java)
@@ -543,7 +820,12 @@ class CallRecordingService : Service() {
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        try {
+            phoneStateReceiver?.let { unregisterReceiver(it) }
+            phoneStateReceiver = null
+        } catch (e: Exception) {
+            Log.w(TAG, "Error unregistering phone-state receiver: ${e.message}")
+        }
         stopCaptureSession()
         try {
             if (wakeLock?.isHeld == true) {
@@ -552,5 +834,6 @@ class CallRecordingService : Service() {
         } catch (e: Exception) {
             Log.w(TAG, "Error releasing wakeLock: ${e.message}")
         }
+        super.onDestroy()
     }
 }

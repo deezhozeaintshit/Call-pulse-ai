@@ -74,8 +74,8 @@ fun SettingsAndQueueScreen(
     val apiKey by viewModel.agnesApiKey.collectAsState()
     val backendUrl by viewModel.backendGatewayUrl.collectAsState()
     val telemetryState by viewModel.telemetryState.collectAsState()
-    val recordAllIncoming by viewModel.recordAllIncoming.collectAsState()
     val autoRecordNumbers by viewModel.autoRecordNumbers.collectAsState()
+    val isMonitoring by viewModel.isMonitoring.collectAsState()
     val batteryExempt by viewModel.isBatteryExemptionGranted.collectAsState()
     val permissionStates by viewModel.essentialPermissionsGranted.collectAsState()
 
@@ -270,6 +270,70 @@ fun SettingsAndQueueScreen(
             }
         }
 
+        // Call Monitoring — persistent service that watches for calls with the app closed.
+        // This is what makes auto-record work: Android 14+ forbids starting a
+        // microphone service from the background, so the service must already be
+        // running (started here, while the app is visible) when the call arrives.
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, ObsidianBorder),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "CALL MONITORING",
+                        color = RadarCyan,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Text(
+                        text = if (isMonitoring) "● ACTIVE" else "○ OFF",
+                        color = if (isMonitoring) Color(0xFF4ADE80) else TextTertiary,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+                Text(
+                    text = "Keeps watch for calls with the app closed so numbers on your list record automatically. Shows an ongoing notification — that is what keeps Android from killing it.",
+                    color = TextSecondary,
+                    fontSize = 11.sp
+                )
+                Button(
+                    onClick = {
+                        if (isMonitoring) viewModel.stopCallMonitoring()
+                        else viewModel.startCallMonitoring()
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isMonitoring) DangerCoral else RadarCyan
+                    ),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(44.dp)
+                        .testTag("call_monitoring_toggle_button")
+                ) {
+                    Text(
+                        text = if (isMonitoring) "STOP MONITORING" else "START MONITORING",
+                        color = ObsidianBlack,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+        }
+
         // Agnes AI Gateway Status
         Card(
             modifier = Modifier.fillMaxWidth(),
@@ -447,37 +511,11 @@ fun SettingsAndQueueScreen(
                     )
                 }
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "Record all incoming calls",
-                            color = TextPrimary,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            text = "When off, only the numbers below are recorded automatically",
-                            color = TextSecondary,
-                            fontSize = 11.sp
-                        )
-                    }
-
-                    Switch(
-                        checked = recordAllIncoming,
-                        onCheckedChange = { viewModel.toggleRecordAllIncoming() },
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = RadarCyan,
-                            checkedTrackColor = Color(0xFF132A42),
-                            uncheckedThumbColor = TitaniumGrey,
-                            uncheckedTrackColor = Color(0xFF1B2433)
-                        ),
-                        modifier = Modifier.testTag("record_all_incoming_toggle")
-                    )
-                }
+                Text(
+                    text = "Only these numbers are ever recorded, incoming or outgoing. Turn on Call Monitoring above and they will record with the app closed.",
+                    color = TextSecondary,
+                    fontSize = 11.sp
+                )
 
                 Text(
                     text = "AUTO-RECORD NUMBERS",
@@ -540,7 +578,7 @@ fun SettingsAndQueueScreen(
 
                 if (autoRecordNumbers.isEmpty()) {
                     Text(
-                        text = "No numbers yet — add one above, or flip the master toggle to record everything.",
+                        text = "No numbers yet — add one above. Nothing records until a number is on this list.",
                         color = TextTertiary,
                         fontSize = 11.sp
                     )
