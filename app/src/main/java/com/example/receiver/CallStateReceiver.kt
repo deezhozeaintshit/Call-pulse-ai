@@ -57,16 +57,21 @@ class CallStateReceiver : BroadcastReceiver() {
 
                 TelephonyManager.EXTRA_STATE_OFFHOOK -> {
                     if (lastState != TelephonyManager.EXTRA_STATE_OFFHOOK) {
-                        Log.i(TAG, "Call answered / off-hook. Starting CallRecordingService.")
+                        Log.i(TAG, "Call answered / off-hook. Evaluating auto-record rules.")
                         val callType = if (isIncoming) "INCOMING" else "OUTGOING"
                         val number = savedNumber ?: "Unknown Caller"
                         val contactName = resolveContactName(context, number)
-                        CallRecordingService.startRecording(
-                            context = context,
-                            phoneNumber = number,
-                            contactName = contactName,
-                            callType = callType
-                        )
+                        if (shouldAutoRecord(context, isIncoming, number)) {
+                            Log.i(TAG, "Auto-record rule matched. Starting CallRecordingService.")
+                            CallRecordingService.startRecording(
+                                context = context,
+                                phoneNumber = number,
+                                contactName = contactName,
+                                callType = callType
+                            )
+                        } else {
+                            Log.i(TAG, "Skipping recording: incoming call from $number is not in the auto-record list and record-all-incoming is off.")
+                        }
                     }
                 }
 
@@ -83,8 +88,31 @@ class CallStateReceiver : BroadcastReceiver() {
         }
     }
 
-    private fun broadcastToUi(context: Context, state: String, number: String?) {
-        try {
+    /**
+     * Auto-record rule evaluation for incoming calls.
+     * - Outgoing calls: unchanged behavior (always record).
+     * - Incoming calls: record when the "record all incoming" master toggle is on,
+     *   or when the caller's number matches the user's auto-record list.
+     * Number matching compares digit sequences, falling back to last-10-digit
+     * suffix matching so "+1 (555) 123-4567" matches "5551234567".
+     */
+    private fun shouldAutoRecord(context: Context, isIncoming: Boolean, number: String?): Boolean {
+        if (!isIncoming) return true
+        val prefs = context.getSharedPreferences("callpulse_prefs", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("record_all_incoming", false)) return true
+        val allowed = prefs.getStringSet("auto_record_numbers", emptySet()) ?: emptySet()
+        if (allowed.isEmpty()) return false
+        val incoming = normalizePhoneNumber(number ?: "")
+        if (incoming.isEmpty()) return false
+        return allowed.any { candidate ->
+            val norm = normalizePhoneNumber(candidate)
+            norm.isNotEmpty() && (norm == incoming || norm.takeLast(10) == incoming.takeLast(10))
+        }
+    }
+
+    private fun normalizePhoneNumber(number: String): String = number.filter { it.isDigit() }
+
+    private fun broadcastToUi(context: Context, state: String, number: String?) {        try {
             val updateIntent = Intent(ACTION_TELEPHONY_STATE_CHANGED).apply {
                 putExtra(EXTRA_STATE, state)
                 putExtra(EXTRA_PHONE_NUMBER, number ?: "")
