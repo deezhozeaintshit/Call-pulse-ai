@@ -41,6 +41,7 @@ import java.util.UUID
 
 /**
  * Foreground Call Recording Service.
+ * Captures 16kHz mono audio (MIC-first source selection) with -16 LUFS leveling.
  *
  * Two modes:
  * 1. MONITOR mode (persistent): started ONCE from the app UI. Shows an ongoing
@@ -442,7 +443,7 @@ class CallRecordingService : Service() {
 
         val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat).coerceAtLeast(4096)
 
-        // Dual Audio Fallback: VOICE_CALL fallback to MIC
+        // MIC-first audio source selection (VOICE_CALL captures silence for non-system apps)
         audioRecord = createAudioRecordWithFallback(bufferSize)
 
         if (audioRecord == null || audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
@@ -521,45 +522,39 @@ class CallRecordingService : Service() {
         }
     }
 
+    /**
+     * Audio source selection, best-first.
+     *
+     * VOICE_CALL would be ideal (uplink + downlink mix) but it requires the
+     * system-only CAPTURE_AUDIO_OUTPUT permission: on most phones a third-party
+     * app's VOICE_CALL recorder *initializes* yet captures digital silence.
+     * So MIC goes first (what every non-root call recorder uses), then
+     * VOICE_COMMUNICATION, with VOICE_CALL kept only as a last resort.
+     *
+     * Note: with MIC, the far side of the call is only audible via speakerphone
+     * (or a Bluetooth speaker) — that is a hardware limit for non-system apps,
+     * not something software can bypass.
+     */
     private fun createAudioRecordWithFallback(bufferSize: Int): AudioRecord? {
-        // Try AudioSource.VOICE_CALL first
-        try {
-            val record = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_CALL,
-                sampleRate,
-                channelConfig,
-                audioFormat,
-                bufferSize
-            )
-            if (record.state == AudioRecord.STATE_INITIALIZED) {
-                Log.i(TAG, "AudioRecord successfully initialized with AudioSource.VOICE_CALL")
-                return record
-            } else {
+        val sources = listOf(
+            MediaRecorder.AudioSource.MIC to "MIC",
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION to "VOICE_COMMUNICATION",
+            MediaRecorder.AudioSource.VOICE_CALL to "VOICE_CALL"
+        )
+        for ((source, name) in sources) {
+            try {
+                val record = AudioRecord(source, sampleRate, channelConfig, audioFormat, bufferSize)
+                if (record.state == AudioRecord.STATE_INITIALIZED) {
+                    Log.i(TAG, "AudioRecord initialized with AudioSource.$name")
+                    return record
+                }
                 record.release()
+                Log.w(TAG, "AudioSource.$name did not initialize, trying next")
+            } catch (e: Exception) {
+                Log.w(TAG, "AudioSource.$name failed (${e.message}), trying next")
             }
-        } catch (e: SecurityException) {
-            Log.w(TAG, "AudioSource.VOICE_CALL not permitted, falling back to AudioSource.MIC: ${e.message}")
-        } catch (e: Exception) {
-            Log.w(TAG, "AudioSource.VOICE_CALL failed (${e.message}), falling back to AudioSource.MIC")
         }
-
-        // Fallback to AudioSource.MIC
-        try {
-            val micRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                sampleRate,
-                channelConfig,
-                audioFormat,
-                bufferSize
-            )
-            if (micRecord.state == AudioRecord.STATE_INITIALIZED) {
-                Log.i(TAG, "AudioRecord fallback successfully initialized with AudioSource.MIC")
-                return micRecord
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "AudioSource.MIC initialization failed: ${e.message}")
-        }
-
+        Log.e(TAG, "All audio sources failed to initialize")
         return null
     }
 

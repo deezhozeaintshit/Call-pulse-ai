@@ -305,7 +305,7 @@ fun SettingsAndQueueScreen(
                     )
                 }
                 Text(
-                    text = "Keeps watch for calls with the app closed so numbers on your list record automatically. Shows an ongoing notification — that is what keeps Android from killing it.",
+                    text = "Keeps watch for calls with the app closed so numbers on your list record automatically. Shows an ongoing notification — that is what keeps Android from killing it. Tip: turn on speakerphone during calls so both sides are heard.",
                     color = TextSecondary,
                     fontSize = 11.sp
                 )
