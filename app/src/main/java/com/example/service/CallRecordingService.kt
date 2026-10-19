@@ -588,6 +588,12 @@ class CallRecordingService : Service() {
      * flips LSBs), so it is released and the next candidate is tried. Probe
      * bytes are kept and written to the output files, so no call audio is lost.
      * Sample rates fall back 16kHz -> 44.1kHz -> 8kHz when unsupported.
+     *
+     * Source order follows the community-settled best practice (Cube ACR FAQ):
+     * VOICE_RECOGNITION first, then VOICE_COMMUNICATION, then MIC, with
+     * VOICE_CALL last (needs a system-only permission; usually silent anyway).
+     * Note Android 10+ can silently deprioritize a third-party MIC stream during
+     * an active call — the probe catches that and moves on automatically.
      */
     private data class SourceProbe(
         val record: AudioRecord,
@@ -600,8 +606,9 @@ class CallRecordingService : Service() {
     private fun selectWorkingAudioSource(): SourceProbe? {
         val rates = listOf(16000, 44100, 8000)
         val sources = listOf(
-            MediaRecorder.AudioSource.MIC to "MIC",
+            MediaRecorder.AudioSource.VOICE_RECOGNITION to "VOICE_RECOGNITION",
             MediaRecorder.AudioSource.VOICE_COMMUNICATION to "VOICE_COMMUNICATION",
+            MediaRecorder.AudioSource.MIC to "MIC",
             MediaRecorder.AudioSource.VOICE_CALL to "VOICE_CALL"
         )
         for (rate in rates) {
