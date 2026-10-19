@@ -110,6 +110,12 @@ class CallPulseViewModel(application: Application) : AndroidViewModel(applicatio
     val agnesApiKey = MutableStateFlow(prefs.getString("agnes_api_key", "") ?: "")
     val backendGatewayUrl = MutableStateFlow(prefs.getString("backend_url", "http://10.0.2.2:8080/api/calls/analyze") ?: "")
 
+    // Auto-record rules: master toggle for all incoming calls + per-number allowlist
+    val recordAllIncoming = MutableStateFlow(prefs.getBoolean("record_all_incoming", false))
+    val autoRecordNumbers = MutableStateFlow(
+        (prefs.getStringSet("auto_record_numbers", emptySet()) ?: emptySet()).sorted()
+    )
+
     // Live Service State
     val isRecording: StateFlow<Boolean> = CallRecordingService.isRecording
     val recordingDuration: StateFlow<Int> = CallRecordingService.recordingDurationSeconds
@@ -576,6 +582,37 @@ class CallPulseViewModel(application: Application) : AndroidViewModel(applicatio
         val next = !wifiOnlyUpload.value
         wifiOnlyUpload.value = next
         prefs.edit().putBoolean("wifi_only", next).apply()
+    }
+
+    fun toggleRecordAllIncoming() {
+        val next = !recordAllIncoming.value
+        recordAllIncoming.value = next
+        prefs.edit().putBoolean("record_all_incoming", next).apply()
+    }
+
+    /**
+     * Adds a phone number to the auto-record allowlist.
+     * Returns false when the input has too few digits to be a real number.
+     */
+    fun addAutoRecordNumber(raw: String): Boolean {
+        val digits = raw.filter { it.isDigit() }
+        if (digits.length < 7) return false
+        val current = autoRecordNumbers.value.toMutableSet()
+        val duplicate = current.any { it.filter { c -> c.isDigit() } == digits }
+        if (!duplicate) {
+            current.add(raw.trim())
+            autoRecordNumbers.value = current.sorted()
+            prefs.edit().putStringSet("auto_record_numbers", current).apply()
+        }
+        return true
+    }
+
+    fun removeAutoRecordNumber(number: String) {
+        val current = autoRecordNumbers.value.toMutableSet()
+        if (current.remove(number)) {
+            autoRecordNumbers.value = current.sorted()
+            prefs.edit().putStringSet("auto_record_numbers", current).apply()
+        }
     }
 
     fun saveAgnesApiKey(key: String) {

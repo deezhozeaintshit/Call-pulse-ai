@@ -15,10 +15,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CloudDone
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Wifi
@@ -45,6 +48,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.ui.CallPulseViewModel
@@ -68,6 +73,11 @@ fun SettingsAndQueueScreen(
     val apiKey by viewModel.agnesApiKey.collectAsState()
     val backendUrl by viewModel.backendGatewayUrl.collectAsState()
     val telemetryState by viewModel.telemetryState.collectAsState()
+    val recordAllIncoming by viewModel.recordAllIncoming.collectAsState()
+    val autoRecordNumbers by viewModel.autoRecordNumbers.collectAsState()
+
+    var numberInput by remember { mutableStateOf("") }
+    var numberError by remember { mutableStateOf<String?>(null) }
 
     var keyInput by remember(apiKey) { mutableStateOf(apiKey) }
     var backendInput by remember(backendUrl) { mutableStateOf(backendUrl) }
@@ -246,6 +256,169 @@ fun SettingsAndQueueScreen(
                         ),
                         modifier = Modifier.testTag("wifi_only_toggle_switch")
                     )
+                }
+            }
+        }
+
+        // Auto-Record Rules: master toggle + per-number allowlist
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, ObsidianBorder),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Phone,
+                        contentDescription = "Auto-record",
+                        tint = RadarCyan,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "AUTO-RECORD RULES",
+                        color = TextPrimary,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Record all incoming calls",
+                            color = TextPrimary,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "When off, only the numbers below are recorded automatically",
+                            color = TextSecondary,
+                            fontSize = 11.sp
+                        )
+                    }
+
+                    Switch(
+                        checked = recordAllIncoming,
+                        onCheckedChange = { viewModel.toggleRecordAllIncoming() },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = RadarCyan,
+                            checkedTrackColor = Color(0xFF132A42),
+                            uncheckedThumbColor = TitaniumGrey,
+                            uncheckedTrackColor = Color(0xFF1B2433)
+                        ),
+                        modifier = Modifier.testTag("record_all_incoming_toggle")
+                    )
+                }
+
+                Text(
+                    text = "AUTO-RECORD NUMBERS",
+                    color = RadarCyan,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.Top
+                ) {
+                    OutlinedTextField(
+                        value = numberInput,
+                        onValueChange = {
+                            numberInput = it
+                            numberError = null
+                        },
+                        label = { Text("Phone number", fontSize = 11.sp) },
+                        placeholder = { Text("+1 555 123 4567") },
+                        singleLine = true,
+                        isError = numberError != null,
+                        supportingText = numberError?.let { { Text(it, fontSize = 10.sp) } },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = RadarCyan,
+                            unfocusedBorderColor = ObsidianBorder,
+                            focusedTextColor = TextPrimary,
+                            unfocusedTextColor = TextPrimary,
+                            errorBorderColor = DangerCoral
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("auto_record_number_field")
+                    )
+                    Button(
+                        onClick = {
+                            if (viewModel.addAutoRecordNumber(numberInput)) {
+                                numberInput = ""
+                            } else {
+                                numberError = "Enter at least 7 digits"
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = RadarCyan),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .height(56.dp)
+                            .testTag("add_auto_record_number_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = "Add number",
+                            tint = ObsidianBlack,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+
+                if (autoRecordNumbers.isEmpty()) {
+                    Text(
+                        text = "No numbers yet — add one above, or flip the master toggle to record everything.",
+                        color = TextTertiary,
+                        fontSize = 11.sp
+                    )
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        autoRecordNumbers.forEach { number ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(Color(0xFF101823), RoundedCornerShape(10.dp))
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = number,
+                                    color = TextPrimary,
+                                    fontSize = 13.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                androidx.compose.material3.IconButton(
+                                    onClick = { viewModel.removeAutoRecordNumber(number) },
+                                    modifier = Modifier
+                                        .size(32.dp)
+                                        .testTag("remove_auto_record_number_$number")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Delete,
+                                        contentDescription = "Remove $number",
+                                        tint = DangerCoral,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
