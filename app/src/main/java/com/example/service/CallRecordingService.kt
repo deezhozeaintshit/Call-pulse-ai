@@ -85,10 +85,16 @@ class CallRecordingService : Service() {
                 putExtra(EXTRA_CONTACT_NAME, contactName)
                 putExtra(EXTRA_CALL_TYPE, callType)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: Exception) {
+                // Android 12+ throws ForegroundServiceStartNotAllowedException when the app
+                // is in the background without the battery-optimization exemption.
+                Log.e(TAG, "Failed to start recording service from background: ${e.message}")
             }
         }
 

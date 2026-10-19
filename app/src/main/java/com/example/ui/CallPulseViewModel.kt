@@ -3,6 +3,7 @@ package com.example.ui
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.MediaPlayer
 import android.media.PlaybackParams
 import android.net.ConnectivityManager
@@ -10,8 +11,11 @@ import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
+import android.os.PowerManager
 import android.os.Process
+import android.provider.Settings
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.audio.AudioEngineDiagnostics
@@ -109,6 +113,22 @@ class CallPulseViewModel(application: Application) : AndroidViewModel(applicatio
     val wifiOnlyUpload = MutableStateFlow(prefs.getBoolean("wifi_only", false))
     val agnesApiKey = MutableStateFlow(prefs.getString("agnes_api_key", "") ?: "")
     val backendGatewayUrl = MutableStateFlow(prefs.getString("backend_url", "http://10.0.2.2:8080/api/calls/analyze") ?: "")
+
+    // Background operation readiness: battery exemption + essential runtime permissions.
+    // Without the exemption, Android 12+ blocks the foreground recording service from
+    // starting when a call arrives with the app closed. Without the phone permissions,
+    // the incoming number is invisible and the allowlist can never match.
+    private val _isBatteryExemptionGranted = MutableStateFlow(false)
+    val isBatteryExemptionGranted: StateFlow<Boolean> = _isBatteryExemptionGranted.asStateFlow()
+
+    private val _essentialPermissionsGranted = MutableStateFlow<Map<String, Boolean>>(emptyMap())
+    val essentialPermissionsGranted: StateFlow<Map<String, Boolean>> = _essentialPermissionsGranted.asStateFlow()
+
+    val essentialPermissionLabels = mapOf(
+        android.Manifest.permission.RECORD_AUDIO to "Microphone",
+        android.Manifest.permission.READ_PHONE_STATE to "Phone state",
+        android.Manifest.permission.READ_CALL_LOG to "Call log (caller ID)"
+    )
 
     // Auto-record rules: master toggle for all incoming calls + per-number allowlist
     val recordAllIncoming = MutableStateFlow(prefs.getBoolean("record_all_incoming", false))
@@ -629,6 +649,52 @@ class CallPulseViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             repository.clearAllData()
             _selectedCallId.value = null
+        }
+    }
+
+    // Background operation readiness
+    fun refreshBackgroundReadiness() {
+        val app = getApplication<Application>()
+        val powerManager = app.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        _isBatteryExemptionGranted.value =
+            powerManager?.isIgnoringBatteryOptimizations(app.packageName) == true
+
+        val permissions = buildList {
+            add(android.Manifest.permission.RECORD_AUDIO)
+            add(android.Manifest.permission.READ_PHONE_STATE)
+            add(android.Manifest.permission.READ_CALL_LOG)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+        _essentialPermissionsGranted.value = permissions.associateWith { permission ->
+            ContextCompat.checkSelfPermission(app, permission) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    fun requestBatteryExemption() {
+        val app = getApplication<Application>()
+        try {
+            val intent = Intent(
+                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:${app.packageName}")
+            ).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK }
+            app.startActivity(intent)
+        } catch (e: Exception) {
+            Log.e("CallPulseViewModel", "Battery exemption request failed: ${e.message}")
+        }
+    }
+
+    fun openAppSystemSettings() {
+        val app = getApplication<Application>()
+        try {
+            val intent = Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:${app.packageName}")
+            ).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK }
+            app.startActivity(intent)
+        } catch (e: Exception) {
+            Log.e("CallPulseViewModel", "Open app settings failed: ${e.message}")
         }
     }
 

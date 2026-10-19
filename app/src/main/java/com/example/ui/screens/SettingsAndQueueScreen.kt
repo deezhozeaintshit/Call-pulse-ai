@@ -37,6 +37,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -75,9 +76,13 @@ fun SettingsAndQueueScreen(
     val telemetryState by viewModel.telemetryState.collectAsState()
     val recordAllIncoming by viewModel.recordAllIncoming.collectAsState()
     val autoRecordNumbers by viewModel.autoRecordNumbers.collectAsState()
+    val batteryExempt by viewModel.isBatteryExemptionGranted.collectAsState()
+    val permissionStates by viewModel.essentialPermissionsGranted.collectAsState()
 
     var numberInput by remember { mutableStateOf("") }
     var numberError by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) { viewModel.refreshBackgroundReadiness() }
 
     var keyInput by remember(apiKey) { mutableStateOf(apiKey) }
     var backendInput by remember(backendUrl) { mutableStateOf(backendUrl) }
@@ -109,6 +114,160 @@ fun SettingsAndQueueScreen(
                 fontSize = 20.sp,
                 fontWeight = FontWeight.ExtraBold
             )
+        }
+
+        // Background Operation — REQUIRED for auto-record with the app closed.
+        // Android kills background apps by default; the exemption below is what lets
+        // CallPulse detect incoming calls and start recording when it isn't open.
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, ObsidianBorder),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Security,
+                            contentDescription = "Background operation",
+                            tint = RadarCyan,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "BACKGROUND OPERATION",
+                            color = TextPrimary,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                    Surface(
+                        color = if (batteryExempt) RadarEmerald.copy(alpha = 0.15f) else WarningAmber.copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(6.dp)
+                    ) {
+                        Text(
+                            text = if (batteryExempt) "UNRESTRICTED" else "RESTRICTED",
+                            color = if (batteryExempt) RadarEmerald else WarningAmber,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+
+                Text(
+                    text = "Auto-record only works with the app closed when Android is told not to kill CallPulse in the background. Tap below, then choose \"Allow\" (may say \"Unrestricted\").",
+                    color = TextSecondary,
+                    fontSize = 11.sp
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = { viewModel.requestBatteryExemption() },
+                        colors = ButtonDefaults.buttonColors(containerColor = RadarCyan),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(44.dp)
+                            .testTag("allow_background_operation_button")
+                    ) {
+                        Text(
+                            text = "ALLOW BACKGROUND OPERATION",
+                            color = ObsidianBlack,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                    Button(
+                        onClick = { viewModel.refreshBackgroundReadiness() },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF182A45)),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .height(44.dp)
+                            .testTag("refresh_background_status_button")
+                    ) {
+                        Text(
+                            text = "CHECK",
+                            color = RadarCyan,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+
+                Text(
+                    text = "REQUIRED PERMISSIONS",
+                    color = RadarCyan,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    permissionStates.forEach { (permission, granted) ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = viewModel.essentialPermissionLabels[permission] ?: "Notifications",
+                                color = TextSecondary,
+                                fontSize = 12.sp
+                            )
+                            Surface(
+                                color = if (granted) RadarEmerald.copy(alpha = 0.15f) else DangerCoral.copy(alpha = 0.15f),
+                                shape = RoundedCornerShape(6.dp)
+                            ) {
+                                Text(
+                                    text = if (granted) "GRANTED" else "DENIED",
+                                    color = if (granted) RadarEmerald else DangerCoral,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+                Text(
+                    text = "Without Phone state + Call log, the caller ID is invisible and the number list can never match.",
+                    color = TextTertiary,
+                    fontSize = 10.sp
+                )
+                Button(
+                    onClick = { viewModel.openAppSystemSettings() },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF182A45)),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(44.dp)
+                        .testTag("open_app_settings_button")
+                ) {
+                    Text(
+                        text = "OPEN APP SETTINGS TO FIX PERMISSIONS",
+                        color = RadarCyan,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
         }
 
         // Agnes AI Gateway Status
